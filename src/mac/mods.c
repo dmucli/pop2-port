@@ -22,6 +22,7 @@ extern maddr g_a5;
 extern int runtime_deterministic;
 #include "../platform/platform.h"
 #include "states.h"
+#include "qd.h"
 void event_menu_command_key(uint8_t ch);
 void event_clear_queue(void);
 extern uint32_t qd_screen_dirty, qd_clut_version;
@@ -135,16 +136,26 @@ static void apply_add_time(void) {
     if (saved_minutes >= 0) saved_minutes = m;
     wr16(G_MSG_ID, 0); wr16(G_MSG_TIMER, 0); wr16(G_SHOW_TIME, 1);
 }
+/* As a potion does: the game's pending change of strength (applied by ChangeMeters this
+ * frame, which also redraws the meter; the game clears it before each frame, before this
+ * runs). When the meter is full, the maximum goes up first. */
+#define G_KID_HP_DELTA   A5(-0x50b0)    /* word: pending change of the kid's strength */
 static void apply_add_health(void) {
     maddr kid = G_KID, cur = G_CUR_CHAR;
-    for (; want_health > 0; want_health--) {
-        int16_t life = (int16_t)rd16(kid + CH_LIFE), max = (int16_t)rd16(kid + CH_MAXLIFE);
-        if (life <= 0) break;                                  /* not for a dead kid */
-        if (life >= max && max < MAX_LIFE) wr16(kid + CH_MAXLIFE, (uint16_t)++max);
-        if (life < max) wr16(kid + CH_LIFE, (uint16_t)(life + 1));
-        if (rd16(cur) == rd16(kid)) { wr16(cur + CH_MAXLIFE, rd16(kid + CH_MAXLIFE)); wr16(cur + CH_LIFE, rd16(kid + CH_LIFE)); }
-    }
+    int life = (int16_t)rd16(kid + CH_LIFE), max = (int16_t)rd16(kid + CH_MAXLIFE);
+    int delta = (int16_t)rd16(G_KID_HP_DELTA);
+    int target = life + delta + want_health;
     want_health = 0;
+    if (life <= 0) return;                                     /* not for a dead kid */
+    if (target > max) {
+        max = target < MAX_LIFE ? target : MAX_LIFE;
+        if (max > (int16_t)rd16(kid + CH_MAXLIFE)) wr16(kid + CH_MAXLIFE, (uint16_t)max);
+        if (rd16(cur) == rd16(kid)) wr16(cur + CH_MAXLIFE, (uint16_t)max);
+    }
+    if (target > max) target = max;
+    if (target > life + delta) wr16(G_KID_HP_DELTA, (uint16_t)(target - life));
+    char t[40]; snprintf(t, sizeof t, "Health %d/%d", target, max);
+    platform_toast(t);
 }
 
 /* ---- copy protection ----
@@ -404,6 +415,34 @@ void mods_frame(void) {
             if (frame_no == 70) { fprintf(stderr, "[mods] overlay pictures done\n"); fflush(stderr); _exit(0); }
             goto selftest_done;
         }
+        if (t == '9') {   /* add health when hurt; follow the counters */
+            static int shot_at = -1, added_at = -1, prev = -1;
+            int adding = added_at < 0 && (int16_t)rd16(G_KID + CH_LIFE) > 0 && (int16_t)rd16(G_KID + CH_LIFE) < (int16_t)rd16(G_KID + CH_MAXLIFE);
+            if (frame_no % 4 == 0 && frame_no < 2000) {
+                char path[256]; snprintf(path, sizeof path, "%s/f%05d_%d.ppm", getenv("POP2_SHOTDIR"), frame_no, (int16_t)rd16(G_KID + CH_LIFE));
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    fprintf(f, "P6\n%d %d\n255\n", qd_screen_w, qd_screen_h);
+                    for (int i = 0; i < qd_screen_w * qd_screen_h; i++) {
+                        uint32_t c = qd_device_rgb(rd8(SCREEN_BASE + (uint32_t)i));
+                        uint8_t px[3] = { (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c };
+                        fwrite(px, 1, 3, f);
+                    }
+                    fclose(f);
+                }
+            }
+            int life = (int16_t)rd16(G_KID + CH_LIFE), max = (int16_t)rd16(G_KID + CH_MAXLIFE);
+            int cur = (int16_t)rd16(G_CUR_CHAR + CH_LIFE), hp = (int16_t)rd16(A5(-0x50b4)), delta = (int16_t)rd16(A5(-0x50b0));
+            if (life != prev || (added_at >= 0 && frame_no - added_at < 6))
+                fprintf(stderr, "[mods] frame %d: kid life %d/%d, current char life %d (char %d, kid %d), delta %d\n",
+                        frame_no, life, max, cur, rd16(G_CUR_CHAR), rd16(G_KID), delta), (void)hp;
+            prev = life;
+            if (added_at < 0 && life > 0 && life < max) { fprintf(stderr, "[mods] hurt: add one health\n"); added_at = frame_no; shot_at = frame_no; }
+            if (added_at >= 0 && frame_no == added_at + 40) { fprintf(stderr, "[mods] frame %d: add one health\n", frame_no); mods_add_health(); }
+            if (added_at >= 0 && frame_no == added_at + 80) { fprintf(stderr, "[mods] frame %d: add one health (twice)\n", frame_no); mods_add_health(); mods_add_health(); }
+            if (frame_no > 4000) _exit(0);
+            goto selftest_done;
+        }
         if (t == '7') {   /* add time and health */
             if (frame_no == 30 || frame_no == 32 || frame_no == 60 || frame_no == 62)
                 fprintf(stderr, "[mods] frame %d: minutes %d, life %d/%d\n", frame_no, (int16_t)rd16(G_MINUTES_LEFT),
@@ -453,11 +492,7 @@ void mods_frame(void) {
     }
     selftest_done:
     if (want_time) apply_add_time();
-    if (want_health) {
-        apply_add_health();
-        char t[40]; snprintf(t, sizeof t, "Health %d/%d", (int16_t)rd16(G_KID + CH_LIFE), (int16_t)rd16(G_KID + CH_MAXLIFE));
-        platform_toast(t);
-    }
+    if (want_health) apply_add_health();
     if (want_level) {
         int l = want_level; want_level = 0;
         char t[24]; snprintf(t, sizeof t, "Level %d", l);
